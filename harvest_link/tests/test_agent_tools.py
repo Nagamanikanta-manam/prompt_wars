@@ -33,7 +33,7 @@ class TestAgentTools(unittest.IsolatedAsyncioTestCase):
     @patch('harvest_link.agent.upload_to_storage')
     async def test_generate_docs(self, mock_upload):
         from harvest_link.agent import generate_docs
-        res = await generate_docs("Donor A", "Best Charity", [{"name": "vegetables", "amount": 60}])
+        res = await generate_docs("Donor A", "Best Charity", '[{"name": "vegetables", "amount": 60}]')
         self.assertEqual(res, "Docs stored in GCS")
         mock_upload.assert_called_once()
         

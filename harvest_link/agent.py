@@ -190,11 +190,19 @@ async def dispatch_driver(charity_name: str) -> str:
     return f"Driver dispatched to {charity_name}"
 
 
-async def generate_docs(donor: str, charity: str, items: list) -> str:
-    """Generate and natively store necessary donation documents in GCS."""
-    validate_food_items(items)
+def safe_parse_items(items_str: str) -> list:
+    """Safely parse JSON string into a valid list to prevent schema faults."""
+    try:
+        return json.loads(items_str)
+    except Exception:
+        raise ValueError("Invalid JSON format for items")
 
-    text = f"{donor} → {charity}\nItems: {items}"
+async def generate_docs(donor: str, charity: str, items: str) -> str:
+    """Generate and natively store necessary donation documents in GCS."""
+    parsed_items = safe_parse_items(items)
+    validate_food_items(parsed_items)
+
+    text = f"{donor} → {charity}\nItems: {parsed_items}"
     filename = f"docs/{datetime.now().timestamp()}.txt"
     upload_to_storage(filename, text)
 
@@ -222,8 +230,8 @@ tools = [
     process_donation
 ]
 
-agent = Agent(
-    name="HarvestLink Pro",
+root_agent = Agent(
+    name="harvestlink_pro",
     instruction=(
         "Handle messy input (voice/image/text). "
         "Extract structured food donation info. "
@@ -231,7 +239,9 @@ agent = Agent(
         "1. process_donation\n"
         "2. find_best_charity\n"
         "3. dispatch_driver\n"
-        "4. generate_docs"
+        "4. generate_docs\n"
+        "IMPORTANT: items must be JSON string like "
+        "[{\"name\": \"vegetables\", \"amount\": 60}]"
     ),
     tools=tools,
     model="gemini-2.5-flash"
@@ -256,7 +266,7 @@ async def main() -> None:
         result1, result2 = await process_all(user_input)
         
         dispatch = await dispatch_driver("Best Charity")
-        docs = await generate_docs("Donor A", "Best Charity", [{"name": "vegetables", "amount": 60}])
+        docs = await generate_docs("Donor A", "Best Charity", '[{"name": "vegetables", "amount": 60}]')
 
         logging.info(f"Process: {result1}, Charity Distances: {result2}, Dispatch: {dispatch}, Docs: {docs}")
 
