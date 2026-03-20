@@ -1,152 +1,191 @@
 import os
 import json
-import time
+import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
+
+# Google Cloud
+from google.cloud import firestore, storage, speech, vision
+import googlemaps
 
 from google.adk.agents import Agent
 
 load_dotenv()
 
-# ==========================================
-# Mock Data
-# ==========================================
-CHARITIES = {
-    "c1": {"name": "Downtown Soup Kitchen", "needs": ["vegetables", "fruit", "bread"], "distance_miles": 2.5, "fridge": True, "zip_code": "90210"},
-    "c2": {"name": "Westside Family Pantry", "needs": ["canned goods", "meat", "dairy"], "distance_miles": 5.0, "fridge": True, "zip_code": "90211"},
-    "c3": {"name": "Community Food Bank", "needs": ["any"], "distance_miles": 12.0, "fridge": False, "zip_code": "90212"}
-}
+# ==============================
+# CONFIG
+# ==============================
+PROJECT_ID = os.getenv("PROJECT_ID")
+BUCKET_NAME = os.getenv("BUCKET_NAME")
+GMAPS_API_KEY = os.getenv("GMAPS_API_KEY")
 
-REGIONAL_ECONOMIC_DATA = {
-    "90210": {"food_insecurity_index": "High", "recent_events": "High demand due to factory closure"},
-    "90211": {"food_insecurity_index": "Medium", "recent_events": "Stable demand"},
-    "90212": {"food_insecurity_index": "Low", "recent_events": "Well funded"}
-}
+db = firestore.Client()
+storage_client = storage.Client()
+gmaps = googlemaps.Client(key=GMAPS_API_KEY)
 
-OUTPUT_DIR = "harvestlink_docs"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# ==============================
+# INPUT PROCESSING (Accessibility)
+# ==============================
 
-# ==========================================
-# Tools
-# ==========================================
+def speech_to_text(audio_file: str) -> str:
+    client = speech.SpeechClient()
 
-def get_regional_need(zip_code: str) -> str:
-    data = REGIONAL_ECONOMIC_DATA.get(zip_code, {"food_insecurity_index": "Unknown"})
-    return json.dumps(data)
+    with open(audio_file, "rb") as f:
+        content = f.read()
 
+    audio = speech.RecognitionAudio(content=content)
+    config = speech.RecognitionConfig(language_code="en-US")
 
-def find_best_charity(category: str, max_spoilage_hours: int) -> str:
-    matches = []
+    response = client.recognize(config=config, audio=audio)
 
-    for cid, data in CHARITIES.items():
-        if "any" in data["needs"] or category.lower() in data["needs"]:
-            if max_spoilage_hours < 12 and not data["fridge"]:
-                continue
-
-            matches.append({
-                "charity_id": cid,
-                "name": data["name"],
-                "zip_code": data["zip_code"],
-                "distance": data["distance_miles"]
-            })
-
-    return json.dumps(matches) if matches else "No charity"
+    return " ".join([r.alternatives[0].transcript for r in response.results])
 
 
-def dispatch_fleet_driver(charity_id: str, food_items: str) -> str:
-    items = json.loads(food_items)
+def image_to_text(image_file: str) -> str:
+    client = vision.ImageAnnotatorClient()
 
-    charity = CHARITIES[charity_id]["name"]
-    summary = ", ".join([f"{i['amount']}lbs {i['name']}" for i in items])
+    with open(image_file, "rb") as f:
+        content = f.read()
 
-    print(f"[ACTION] Dispatch → {charity} with {summary}")
-    time.sleep(1)
+    image = vision.Image(content=content)
+    response = client.label_detection(image=image)
 
-    return f"Driver sent to {charity}"
-
-
-def generate_financial_docs(
-    donor_name: str,
-    charity_id: str,
-    food_items: str,
-    estimated_value_usd: float
-) -> str:
-    items = json.loads(food_items)
-
-    charity = CHARITIES[charity_id]["name"]
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    item_str = "\n".join([f"{i['amount']}lbs {i['name']}" for i in items])
-
-    # Receipt
-    with open(f"{OUTPUT_DIR}/receipt.txt", "w") as f:
-        f.write(f"Donor: {donor_name}\nValue: ${estimated_value_usd}\nDate: {timestamp}")
-
-    # Bill of Lading
-    with open(f"{OUTPUT_DIR}/bol.txt", "w") as f:
-        f.write(f"Destination: {charity}\nItems:\n{item_str}")
-
-    print("[ACTION] Documents generated")
-
-    return "Docs created"
+    labels = [label.description for label in response.label_annotations]
+    return "Detected: " + ", ".join(labels)
 
 
-# ==========================================
-# Agent
-# ==========================================
+# ==============================
+# VALIDATION (Security)
+# ==============================
+
+def validate_food_items(items):
+    if not isinstance(items, list):
+        raise ValueError("Invalid food_items format")
+
+    for i in items:
+        if "name" not in i or "amount" not in i:
+            raise ValueError("Invalid item structure")
+
+    return True
+
+
+# ==============================
+# FIRESTORE (Real-time DB)
+# ==============================
+
+def store_request(data: dict):
+    db.collection("donations").add(data)
+
+
+# ==============================
+# MAPS (Efficiency + Real-world)
+# ==============================
+
+def get_distance(origin_zip, dest_zip):
+    result = gmaps.distance_matrix(origin_zip, dest_zip)
+    return result["rows"][0]["elements"][0]["distance"]["value"]
+
+
+# ==============================
+# STORAGE (Docs)
+# ==============================
+
+def upload_to_storage(filename, content):
+    bucket = storage_client.bucket(BUCKET_NAME)
+    blob = bucket.blob(filename)
+    blob.upload_from_string(content)
+
+
+# ==============================
+# TOOLS
+# ==============================
+
+async def find_best_charity(category: str) -> str:
+    charities = db.collection("charities").stream()
+
+    best = None
+    best_score = 999999
+
+    for c in charities:
+        data = c.to_dict()
+
+        if category.lower() in data["needs"] or "any" in data["needs"]:
+            dist = get_distance("90210", data["zip"])
+
+            if dist < best_score:
+                best = data
+                best_score = dist
+
+    return json.dumps(best)
+
+
+async def dispatch_driver(charity_name: str):
+    await asyncio.sleep(0.1)  # simulate async job
+    return f"Driver dispatched to {charity_name}"
+
+
+async def generate_docs(donor, charity, items):
+    validate_food_items(items)
+
+    text = f"{donor} → {charity}\nItems: {items}"
+
+    filename = f"docs/{datetime.now().timestamp()}.txt"
+    upload_to_storage(filename, text)
+
+    return "Docs stored in GCS"
+
+
+async def process_donation(input_text: str):
+    structured = {
+        "raw": input_text,
+        "timestamp": str(datetime.now())
+    }
+
+    store_request(structured)
+
+    return "Stored"
+
+
+# ==============================
+# AGENT
+# ==============================
+
 tools = [
     find_best_charity,
-    get_regional_need,
-    dispatch_fleet_driver,
-    generate_financial_docs
+    dispatch_driver,
+    generate_docs,
+    process_donation
 ]
 
-root_agent = Agent(
-    name="HarvestLink",
+agent = Agent(
+    name="HarvestLink Pro",
     instruction=(
-        "Extract food info from messy input. "
-        "Use tools step by step.\n"
-        "IMPORTANT: When passing food_items, use JSON string like "
-        "[{\"name\": \"vegetables\", \"amount\": 60}]"
+        "Handle messy input (voice/image/text). "
+        "Extract structured food donation info. "
+        "Call tools in order:\n"
+        "1. process_donation\n"
+        "2. find_best_charity\n"
+        "3. dispatch_driver\n"
+        "4. generate_docs"
     ),
     tools=tools,
     model="gemini-2.5-flash"
 )
 
-# ==========================================
-# Run
-# ==========================================
+# ==============================
+# ENTRY
+# ==============================
+
+async def main():
+    user_input = "We have vegetables expiring in 24 hours"
+
+    result = await process_donation(user_input)
+    charity = await find_best_charity("vegetables")
+    dispatch = await dispatch_driver("Best Charity")
+    docs = await generate_docs("Donor A", "Best Charity", [{"name": "vegetables", "amount": 60}])
+
+    print(result, charity, dispatch, docs)
+
+
 if __name__ == "__main__":
-    port = os.environ.get("PORT")
-
-    if port:
-        from google.adk.server import serve
-        serve(root_agent, host="0.0.0.0", port=int(port))
-    else:
-        from google.adk.runners import Runner
-        from google.adk.sessions.in_memory_session_service import InMemorySessionService
-        from google.genai import types
-
-        runner = Runner(
-            app_name="harvest_link",
-            agent=root_agent,
-            session_service=InMemorySessionService(),
-            auto_create_session=True
-        )
-
-        message = types.Content(
-            role="user",
-            parts=[types.Part.from_text(
-                text="We have 60 pounds of vegetables expiring in 24 hours"
-            )]
-        )
-
-        for event in runner.run(
-            user_id="u1",
-            session_id="s1",
-            new_message=message
-        ):
-            if event.content:
-                for part in event.content.parts:
-                    if part.text:
-                        print(part.text)
+    asyncio.run(main())
